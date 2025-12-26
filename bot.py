@@ -30,10 +30,6 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 # ================== SAFE FACEIT API ==================
 
 def faceit_get(url, retries=3, delay=2):
-    """
-    Robust Faceit GET with retry.
-    NEVER raises exception to caller.
-    """
     for attempt in range(1, retries + 1):
         try:
             r = requests.get(url, headers=HEADERS, timeout=10)
@@ -171,9 +167,9 @@ async def last5(ctx, nickname: str):
         map_name, score = get_map_and_score(details)
 
         stats = get_player_stats(details, nickname)
-        kills = stats.get("Kills", "0")
-        deaths = stats.get("Deaths", "0")
-        kd = round(int(kills) / max(int(deaths), 1), 2)
+        kills = int(stats.get("Kills", 0))
+        deaths = int(stats.get("Deaths", 0))
+        kd = round(kills / max(deaths, 1), 2)
 
         embed.add_field(
             name=f"{'W' if won else 'L'} | {score} | {map_name}",
@@ -183,7 +179,7 @@ async def last5(ctx, nickname: str):
 
     await ctx.send(embed=embed)
 
-# ================== MATCH LOOP (CRASH SAFE) ==================
+# ================== MATCH LOOP ==================
 
 async def match_loop():
     await bot.wait_until_ready()
@@ -214,6 +210,11 @@ async def match_loop():
                 won = did_player_win(details, nickname)
                 map_name, score = get_map_and_score(details)
 
+                stats = get_player_stats(details, nickname)
+                kills = int(stats.get("Kills", 0))
+                deaths = int(stats.get("Deaths", 0))
+                kd = round(kills / max(deaths, 1), 2)
+
                 current_elo = get_player_elo(pid)
                 if current_elo is None:
                     continue
@@ -230,6 +231,11 @@ async def match_loop():
                 embed.add_field(name="Result", value="Win ✅" if won else "Loss ❌", inline=True)
                 embed.add_field(name="Score", value=score, inline=True)
                 embed.add_field(name="Map", value=map_name, inline=True)
+                embed.add_field(
+                    name="Stats",
+                    value=f"🔫 K/D: {kills}/{deaths} ({kd})",
+                    inline=False
+                )
                 embed.add_field(
                     name="ELO",
                     value=f"{prev_elo} → {current_elo} ({elo_diff:+})",
@@ -250,8 +256,7 @@ async def match_loop():
                 save_users(users)
 
         except Exception as e:
-            # ABSOLUTE LAST LINE OF DEFENCE
-            print("[MATCH LOOP CRASH PREVENTED]:", e)
+            print("[MATCH LOOP ERROR – recovered]:", e)
 
         await asyncio.sleep(CHECK_INTERVAL)
 
