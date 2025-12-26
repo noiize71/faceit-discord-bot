@@ -5,7 +5,7 @@ import asyncio
 import json
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from requests.exceptions import RequestException
 
@@ -128,7 +128,7 @@ def update_weekly(weekly, nickname, won, elo_diff):
     weekly[nickname]["wins" if won else "losses"] += 1
 
 def is_recap_time():
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     return now.weekday() == 6 and now.hour == 20
 
 async def send_weekly_recap(channel, weekly):
@@ -247,3 +247,4 @@ async def match_loop():
 # ================== START ==================
 
 bot.run(DISCORD_TOKEN)
+
