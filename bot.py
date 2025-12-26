@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import time
+from datetime import datetime
 from dotenv import load_dotenv
 from requests.exceptions import RequestException
 
@@ -16,6 +17,7 @@ FACEIT_API_KEY = os.getenv("FACEIT_API_KEY")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 
 USERS_FILE = "users.json"
+WEEKLY_FILE = "weekly_stats.json"
 CHECK_INTERVAL = 120
 
 HEADERS = {
@@ -41,21 +43,21 @@ def faceit_get(url, retries=3, delay=2):
                 time.sleep(delay)
     return None
 
-# ================== DATA ==================
+# ================== FILE HELPERS ==================
 
-def load_users():
+def load_json(path):
     try:
-        with open(USERS_FILE, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return {}
 
-def save_users(data):
+def save_json(path, data):
     try:
-        with open(USERS_FILE, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4)
     except Exception as e:
-        print("Failed saving users.json:", e)
+        print(f"Failed saving {path}:", e)
 
 # ================== FACEIT HELPERS ==================
 
@@ -79,9 +81,6 @@ def get_team_players(team):
     return team.get("players") or team.get("roster") or []
 
 def did_player_win(details, nickname):
-    if not details:
-        return False
-
     winner = details.get("results", {}).get("winner")
     for team_key in ["faction1", "faction2"]:
         team = details.get("teams", {}).get(team_key, {})
@@ -90,28 +89,20 @@ def did_player_win(details, nickname):
                 return team_key == winner
     return False
 
-# 🔥 ROBUST PLAYER STATS (FIXER 0/0 BUG)
 def get_player_stats(details, nickname):
-    # 1️⃣ Primary location
     for p in details.get("players", []):
         if p.get("nickname", "").lower() == nickname.lower():
             return p.get("player_stats", {})
-
-    # 2️⃣ Fallback: rounds → teams → players
     for rnd in details.get("rounds", []):
         for team in rnd.get("teams", []):
             for p in team.get("players", []):
                 if p.get("nickname", "").lower() == nickname.lower():
                     return p.get("player_stats", {})
-
     return {}
 
 def get_map_and_score(details):
     map_name = "Unknown"
     score = "N/A"
-
-    if not details:
-        return map_name, score
 
     voting = details.get("voting", {}).get("map", {})
     if voting.get("pick"):
@@ -124,10 +115,43 @@ def get_map_and_score(details):
     return map_name, score
 
 def update_streak(previous, won):
-    if won:
-        return 1 if previous <= 0 else previous + 1
-    else:
-        return -1 if previous >= 0 else previous - 1
+    return 1 if won and previous <= 0 else previous + 1 if won else -1 if previous >= 0 else previous - 1
+
+# ================== WEEKLY RECAP ==================
+
+def update_weekly(weekly, nickname, won, elo_diff):
+    if nickname not in weekly:
+        weekly[nickname] = {"games": 0, "wins": 0, "losses": 0, "elo": 0}
+
+    weekly[nickname]["games"] += 1
+    weekly[nickname]["elo"] += elo_diff
+    weekly[nickname]["wins" if won else "losses"] += 1
+
+def is_recap_time():
+    now = datetime.utcnow()
+    return now.weekday() == 6 and now.hour == 20
+
+async def send_weekly_recap(channel, weekly):
+    if not weekly:
+        return
+
+    embed = discord.Embed(
+        title="📊 Weekly Faceit Recap",
+        color=discord.Color.gold()
+    )
+
+    for nick, stats in weekly.items():
+        embed.add_field(
+            name=nick,
+            value=(
+                f"Kampe: {stats['games']}\n"
+                f"W / L: {stats['wins']} / {stats['losses']}\n"
+                f"ELO: {stats['elo']:+}"
+            ),
+            inline=False
+        )
+
+    await channel.send(embed=embed)
 
 # ================== EVENTS ==================
 
@@ -135,66 +159,6 @@ def update_streak(previous, won):
 async def on_ready():
     print(f"Logged in as {bot.user}")
     asyncio.create_task(match_loop())
-
-# ================== COMMANDS ==================
-
-@bot.command()
-async def help(ctx):
-    embed = discord.Embed(title="📊 Faceit Bot", color=discord.Color.blurple())
-    embed.add_field(name="!elo <nick>", value="Vis nuværende ELO", inline=False)
-    embed.add_field(name="!last5 <nick>", value="Sidste 5 kampe", inline=False)
-    await ctx.send(embed=embed)
-
-@bot.command()
-async def elo(ctx, nickname: str):
-    pid = get_player_id(nickname)
-    if not pid:
-        return await ctx.send("Kunne ikke finde spilleren.")
-
-    elo = get_player_elo(pid)
-    if elo is None:
-        return await ctx.send("Faceit API fejl – prøv igen senere.")
-
-    embed = discord.Embed(
-        title=f"🎯 {nickname}",
-        description=f"**ELO: {elo}**",
-        color=discord.Color.green()
-    )
-    await ctx.send(embed=embed)
-
-@bot.command(name="last5")
-async def last5(ctx, nickname: str):
-    pid = get_player_id(nickname)
-    if not pid:
-        return await ctx.send("Kunne ikke finde spilleren.")
-
-    matches = get_last_matches(pid, 5)
-    embed = discord.Embed(title=f"📊 Last 5 – {nickname}", color=discord.Color.orange())
-
-    for m in matches:
-        details = faceit_get(f"https://open.faceit.com/data/v4/matches/{m['match_id']}")
-        won = did_player_win(details, nickname)
-        map_name, score = get_map_and_score(details)
-
-        stats = get_player_stats(details, nickname)
-        kills = stats.get("Kills")
-        deaths = stats.get("Deaths")
-
-        if kills is None or deaths is None:
-            stats_text = "Stats unavailable"
-        else:
-            kills = int(kills)
-            deaths = int(deaths)
-            kd = round(kills / max(deaths, 1), 2)
-            stats_text = f"K/D {kills}/{deaths} ({kd})"
-
-        embed.add_field(
-            name=f"{'W' if won else 'L'} | {score} | {map_name}",
-            value=stats_text,
-            inline=False
-        )
-
-    await ctx.send(embed=embed)
 
 # ================== MATCH LOOP ==================
 
@@ -204,7 +168,8 @@ async def match_loop():
 
     while True:
         try:
-            users = load_users()
+            users = load_json(USERS_FILE)
+            weekly = load_json(WEEKLY_FILE)
 
             for user in users.values():
                 nickname = user["nickname"]
@@ -230,21 +195,15 @@ async def match_loop():
                 stats = get_player_stats(details, nickname)
                 kills = stats.get("Kills")
                 deaths = stats.get("Deaths")
-
-                if kills is None or deaths is None:
-                    stats_text = "Stats unavailable"
-                else:
-                    kills = int(kills)
-                    deaths = int(deaths)
-                    kd = round(kills / max(deaths, 1), 2)
-                    stats_text = f"🔫 K/D: {kills}/{deaths} ({kd})"
+                stats_text = (
+                    f"🔫 K/D: {kills}/{deaths} ({round(int(kills)/max(int(deaths),1),2)})"
+                    if kills and deaths else "Stats unavailable"
+                )
 
                 current_elo = get_player_elo(pid)
-                if current_elo is None:
-                    continue
-
                 prev_elo = user.get("last_elo", current_elo)
                 elo_diff = current_elo - prev_elo
+
                 streak = update_streak(user.get("streak", 0), won)
 
                 embed = discord.Embed(
@@ -271,7 +230,14 @@ async def match_loop():
                 user["last_match"] = match_id
                 user["last_elo"] = current_elo
                 user["streak"] = streak
-                save_users(users)
+                update_weekly(weekly, nickname, won, elo_diff)
+
+                save_json(USERS_FILE, users)
+                save_json(WEEKLY_FILE, weekly)
+
+            if is_recap_time():
+                await send_weekly_recap(channel, weekly)
+                save_json(WEEKLY_FILE, {})
 
         except Exception as e:
             print("[MATCH LOOP ERROR – recovered]:", e)
