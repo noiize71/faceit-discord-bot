@@ -36,7 +36,7 @@ def faceit_get(url, retries=3, delay=2):
             r.raise_for_status()
             return r.json()
         except RequestException as e:
-            print(f"[Faceit API] Error (attempt {attempt}/{retries}): {e}")
+            print(f"[Faceit API] Error ({attempt}/{retries}): {e}")
             if attempt < retries:
                 time.sleep(delay)
     return None
@@ -90,10 +90,20 @@ def did_player_win(details, nickname):
                 return team_key == winner
     return False
 
+# 🔥 ROBUST PLAYER STATS (FIXER 0/0 BUG)
 def get_player_stats(details, nickname):
+    # 1️⃣ Primary location
     for p in details.get("players", []):
         if p.get("nickname", "").lower() == nickname.lower():
             return p.get("player_stats", {})
+
+    # 2️⃣ Fallback: rounds → teams → players
+    for rnd in details.get("rounds", []):
+        for team in rnd.get("teams", []):
+            for p in team.get("players", []):
+                if p.get("nickname", "").lower() == nickname.lower():
+                    return p.get("player_stats", {})
+
     return {}
 
 def get_map_and_score(details):
@@ -167,13 +177,20 @@ async def last5(ctx, nickname: str):
         map_name, score = get_map_and_score(details)
 
         stats = get_player_stats(details, nickname)
-        kills = int(stats.get("Kills", 0))
-        deaths = int(stats.get("Deaths", 0))
-        kd = round(kills / max(deaths, 1), 2)
+        kills = stats.get("Kills")
+        deaths = stats.get("Deaths")
+
+        if kills is None or deaths is None:
+            stats_text = "Stats unavailable"
+        else:
+            kills = int(kills)
+            deaths = int(deaths)
+            kd = round(kills / max(deaths, 1), 2)
+            stats_text = f"K/D {kills}/{deaths} ({kd})"
 
         embed.add_field(
             name=f"{'W' if won else 'L'} | {score} | {map_name}",
-            value=f"K/D {kills}/{deaths} ({kd})",
+            value=stats_text,
             inline=False
         )
 
@@ -211,9 +228,16 @@ async def match_loop():
                 map_name, score = get_map_and_score(details)
 
                 stats = get_player_stats(details, nickname)
-                kills = int(stats.get("Kills", 0))
-                deaths = int(stats.get("Deaths", 0))
-                kd = round(kills / max(deaths, 1), 2)
+                kills = stats.get("Kills")
+                deaths = stats.get("Deaths")
+
+                if kills is None or deaths is None:
+                    stats_text = "Stats unavailable"
+                else:
+                    kills = int(kills)
+                    deaths = int(deaths)
+                    kd = round(kills / max(deaths, 1), 2)
+                    stats_text = f"🔫 K/D: {kills}/{deaths} ({kd})"
 
                 current_elo = get_player_elo(pid)
                 if current_elo is None:
@@ -221,7 +245,6 @@ async def match_loop():
 
                 prev_elo = user.get("last_elo", current_elo)
                 elo_diff = current_elo - prev_elo
-
                 streak = update_streak(user.get("streak", 0), won)
 
                 embed = discord.Embed(
@@ -231,11 +254,7 @@ async def match_loop():
                 embed.add_field(name="Result", value="Win ✅" if won else "Loss ❌", inline=True)
                 embed.add_field(name="Score", value=score, inline=True)
                 embed.add_field(name="Map", value=map_name, inline=True)
-                embed.add_field(
-                    name="Stats",
-                    value=f"🔫 K/D: {kills}/{deaths} ({kd})",
-                    inline=False
-                )
+                embed.add_field(name="Stats", value=stats_text, inline=False)
                 embed.add_field(
                     name="ELO",
                     value=f"{prev_elo} → {current_elo} ({elo_diff:+})",
@@ -252,7 +271,6 @@ async def match_loop():
                 user["last_match"] = match_id
                 user["last_elo"] = current_elo
                 user["streak"] = streak
-
                 save_users(users)
 
         except Exception as e:
