@@ -29,6 +29,9 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
+# ================== GLOBAL START TIME ==================
+BOT_START_TIME = datetime.now(timezone.utc)
+
 # ================== SAFE FACEIT API ==================
 
 def faceit_get(url, retries=3, delay=2):
@@ -115,7 +118,10 @@ def get_map_and_score(details):
     return map_name, score
 
 def update_streak(previous, won):
-    return 1 if won and previous <= 0 else previous + 1 if won else -1 if previous >= 0 else previous - 1
+    if won:
+        return 1 if previous <= 0 else previous + 1
+    else:
+        return -1 if previous >= 0 else previous - 1
 
 # ================== WEEKLY RECAP ==================
 
@@ -135,10 +141,7 @@ async def send_weekly_recap(channel, weekly):
     if not weekly:
         return
 
-    embed = discord.Embed(
-        title="📊 Weekly Faceit Recap",
-        color=discord.Color.gold()
-    )
+    embed = discord.Embed(title="📊 Weekly Faceit Recap", color=discord.Color.gold())
 
     for nick, stats in weekly.items():
         embed.add_field(
@@ -181,11 +184,19 @@ async def match_loop():
                 if not matches:
                     continue
 
-                match_id = matches[0]["match_id"]
-                if user.get("last_match") == match_id:
+                match = matches[0]
+
+                # ⛔ IGNORE MATCHES FINISHED BEFORE BOT START
+                finished_at = datetime.fromtimestamp(match["finished_at"], timezone.utc)
+                if finished_at < BOT_START_TIME:
+                    user["last_match"] = match["match_id"]
+                    save_json(USERS_FILE, users)
                     continue
 
-                details = faceit_get(f"https://open.faceit.com/data/v4/matches/{match_id}")
+                if user.get("last_match") == match["match_id"]:
+                    continue
+
+                details = faceit_get(f"https://open.faceit.com/data/v4/matches/{match['match_id']}")
                 if not details:
                     continue
 
@@ -195,15 +206,18 @@ async def match_loop():
                 stats = get_player_stats(details, nickname)
                 kills = stats.get("Kills")
                 deaths = stats.get("Deaths")
-                stats_text = (
-                    f"🔫 K/D: {kills}/{deaths} ({round(int(kills)/max(int(deaths),1),2)})"
-                    if kills and deaths else "Stats unavailable"
-                )
+
+                if kills is None or deaths is None:
+                    stats_text = "Stats unavailable"
+                else:
+                    kills = int(kills)
+                    deaths = int(deaths)
+                    kd = round(kills / max(deaths, 1), 2)
+                    stats_text = f"🔫 K/D: {kills}/{deaths} ({kd})"
 
                 current_elo = get_player_elo(pid)
                 prev_elo = user.get("last_elo", current_elo)
                 elo_diff = current_elo - prev_elo
-
                 streak = update_streak(user.get("streak", 0), won)
 
                 embed = discord.Embed(
@@ -227,7 +241,7 @@ async def match_loop():
 
                 await channel.send(embed=embed)
 
-                user["last_match"] = match_id
+                user["last_match"] = match["match_id"]
                 user["last_elo"] = current_elo
                 user["streak"] = streak
                 update_weekly(weekly, nickname, won, elo_diff)
@@ -247,4 +261,3 @@ async def match_loop():
 # ================== START ==================
 
 bot.run(DISCORD_TOKEN)
-
