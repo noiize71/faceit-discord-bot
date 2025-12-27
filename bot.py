@@ -1,249 +1,235 @@
 import discord
-import os
-import json
-import asyncio
+from discord.ext import commands
 import requests
-from discord import Embed
+import asyncio
+import json
+import os
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
-# ---------------- CONFIG ----------------
-
+# ================== ENV ==================
 load_dotenv()
 
-TOKEN = os.getenv("DISCORD_TOKEN")
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 FACEIT_API_KEY = os.getenv("FACEIT_API_KEY")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 
 USERS_FILE = "users.json"
-HEADERS = {"Authorization": f"Bearer {FACEIT_API_KEY}"}
+WEEKLY_FILE = "weekly_stats.json"
+CHECK_INTERVAL = 120
 
+HEADERS = {"Authorization": f"Bearer {FACEIT_API_KEY}"}
+BOT_START_TIME = datetime.now(timezone.utc)
+DK_TZ = ZoneInfo("Europe/Copenhagen")
+
+# ================== BOT ==================
 intents = discord.Intents.default()
 intents.message_content = True
-client = discord.Client(intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
-# ---------------- UTIL ----------------
+# ================== API ==================
+def faceit_get(url):
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
 
-def load_users():
-    if not os.path.exists(USERS_FILE):
+# ================== FILE HELPERS ==================
+def load_json(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
         return {}
-    with open(USERS_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
 
-def save_users(users):
-    with open(USERS_FILE, "w", encoding="utf-8") as f:
-        json.dump(users, f, indent=4)
+def save_json(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4)
 
-def get_player(nickname):
-    r = requests.get(
-        f"https://open.faceit.com/data/v4/players?nickname={nickname}",
-        headers=HEADERS
-    )
-    return r.json()
+# ================== FACEIT HELPERS ==================
+def get_player_id(nick):
+    d = faceit_get(f"https://open.faceit.com/data/v4/players?nickname={nick}")
+    return d["player_id"] if d else None
 
-def get_last_matches(player_id, limit=5):
-    r = requests.get(
-        f"https://open.faceit.com/data/v4/players/{player_id}/history?game=cs2&limit={limit}",
-        headers=HEADERS
-    )
-    return r.json().get("items", [])
+def get_player_elo(pid):
+    d = faceit_get(f"https://open.faceit.com/data/v4/players/{pid}")
+    return d["games"]["cs2"]["faceit_elo"] if d else None
+
+def get_last_match(pid):
+    d = faceit_get(f"https://open.faceit.com/data/v4/players/{pid}/history?game=cs2&limit=1")
+    return d["items"][0] if d and d.get("items") else None
+
+def get_match_details(match_id):
+    return faceit_get(f"https://open.faceit.com/data/v4/matches/{match_id}")
 
 def get_match_stats(match_id):
-    r = requests.get(
-        f"https://open.faceit.com/data/v4/matches/{match_id}/stats",
-        headers=HEADERS
-    )
-    return r.json()
+    return faceit_get(f"https://open.faceit.com/data/v4/matches/{match_id}/stats")
 
-def update_streak(user, won):
-    streak = user.get("streak", 0)
+def get_team_players(team):
+    return team.get("players") or team.get("roster") or []
+
+def get_player_faction(details, nick):
+    for faction in ["faction1", "faction2"]:
+        team = details["teams"].get(faction, {})
+        for p in get_team_players(team):
+            if p.get("nickname", "").lower() == nick.lower():
+                return faction
+    return None
+
+def did_player_win(details, nick):
+    faction = get_player_faction(details, nick)
+    if not faction:
+        return False
+
+    score = details["results"]["score"]
+    my_score = score[faction]
+    other = "faction1" if faction == "faction2" else "faction2"
+    return my_score > score[other]
+
+def get_map_and_score(details):
+    map_name = details.get("voting", {}).get("map", {}).get("pick", ["Unknown"])[0]
+    s = details["results"]["score"]
+    return map_name, f"{s['faction1']}-{s['faction2']}"
+
+def get_player_stats(stats_data, nick):
+    for team in stats_data.get("rounds", []):
+        for p in team.get("players", []):
+            if p.get("nickname", "").lower() == nick.lower():
+                return p.get("player_stats", {})
+    return {}
+
+def update_streak(prev, won):
     if won:
-        streak = streak + 1 if streak >= 0 else 1
-    else:
-        streak = streak - 1 if streak <= 0 else -1
-    user["streak"] = streak
-    return streak
+        return 1 if prev <= 0 else prev + 1
+    return -1 if prev >= 0 else prev - 1
 
-def extract_player_and_score(match_stats, nickname):
-    rounds = match_stats.get("rounds", [])
-    if not rounds:
-        return None
+# ================== WEEKLY ==================
+def update_weekly(weekly, nick, won, elo_diff):
+    if nick not in weekly:
+        weekly[nick] = {"games": 0, "wins": 0, "losses": 0, "elo": 0}
+    weekly[nick]["games"] += 1
+    weekly[nick]["elo"] += elo_diff
+    weekly[nick]["wins" if won else "losses"] += 1
 
-    my_score = None
-    enemy_score = None
-    kills = deaths = 0
+def is_weekly_recap_time(last_sent):
+    now = datetime.now(DK_TZ)
+    return (
+        now.weekday() == 6 and
+        now.hour == 22 and
+        (last_sent is None or last_sent.date() != now.date())
+    )
 
-    for team in rounds[0]["teams"]:
-        score = int(team["team_stats"]["Final Score"])
-        for p in team["players"]:
-            if p["nickname"].lower() == nickname.lower():
-                my_score = score
-                kills = int(p["player_stats"]["Kills"])
-                deaths = int(p["player_stats"]["Deaths"])
-            else:
-                enemy_score = score
-
-    if my_score is None or enemy_score is None:
-        return None
-
-    kd = round(kills / max(1, deaths), 2)
-    return my_score, enemy_score, kills, deaths, kd
-
-# ---------------- COMMANDS ----------------
-
-@client.event
-async def on_message(message):
-    if message.author.bot:
+async def send_weekly_recap(channel, weekly):
+    if not weekly:
         return
-
-    # HELP
-    if message.content.startswith("!help"):
-        embed = Embed(title="🤖 Faceit Bot Commands", color=0x95a5a6)
-        embed.add_field(name="!faceit <navn>", value="Registrer Faceit-bruger", inline=False)
-        embed.add_field(name="!elo <navn>", value="Vis nuværende ELO", inline=False)
-        embed.add_field(name="!last5 <navn>", value="Vis sidste 5 kampe", inline=False)
-        await message.channel.send(embed=embed)
-
-    # REGISTER USER
-    if message.content.startswith("!faceit"):
-        parts = message.content.split()
-        if len(parts) != 2:
-            await message.channel.send("Brug: `!faceit FaceitNavn`")
-            return
-
-        nickname = parts[1]
-        users = load_users()
-
-        users[nickname.lower()] = {
-            "nickname": nickname,
-            "last_match": None,
-            "last_elo": None,
-            "streak": 0
-        }
-
-        save_users(users)
-        await message.channel.send(f"✅ **{nickname}** er nu registreret!")
-
-    # ELO
-    if message.content.startswith("!elo"):
-        parts = message.content.split()
-        if len(parts) != 2:
-            return
-
-        nickname = parts[1]
-        player = get_player(nickname)
-        elo = player["games"]["cs2"]["faceit_elo"]
-
-        embed = Embed(title="📊 Faceit ELO", description=f"**{nickname}**", color=0x3498db)
-        embed.add_field(name="Total ELO", value=str(elo))
-        await message.channel.send(embed=embed)
-
-    # LAST 5 MATCHES (CORRECT W/L)
-    if message.content.startswith("!last5"):
-        parts = message.content.split()
-        if len(parts) != 2:
-            await message.channel.send("Brug: `!last5 FaceitNavn`")
-            return
-
-        nickname = parts[1]
-        player = get_player(nickname)
-        matches = get_last_matches(player["player_id"], 5)
-
-        embed = Embed(
-            title="🕘 Sidste 5 Faceit-kampe",
-            description=f"**{nickname}**",
-            color=0x9b59b6
+    embed = discord.Embed(title="📊 Weekly Faceit Recap", color=discord.Color.gold())
+    for nick, s in weekly.items():
+        embed.add_field(
+            name=nick,
+            value=f"Kampe: {s['games']}\nW/L: {s['wins']} / {s['losses']}\nELO: {s['elo']:+}",
+            inline=False
         )
+    await channel.send(embed=embed)
 
-        for m in matches:
-            stats = get_match_stats(m["match_id"])
-            data = extract_player_and_score(stats, nickname)
+# ================== EVENTS ==================
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user}")
+    asyncio.create_task(match_loop())
 
-            if not data:
-                continue
-
-            my_score, enemy_score, _, _, _ = data
-            result = "✅ Win" if my_score > enemy_score else "❌ Loss"
-
-            embed.add_field(
-                name=result,
-                value=f"Score: **{my_score}–{enemy_score}**",
-                inline=False
-            )
-
-        await message.channel.send(embed=embed)
-
-# ---------------- AUTO MATCH TRACKER ----------------
-
+# ================== MATCH LOOP ==================
 async def match_loop():
-    await client.wait_until_ready()
-    channel = client.get_channel(CHANNEL_ID)
+    await bot.wait_until_ready()
+    channel = bot.get_channel(CHANNEL_ID)
+    last_weekly_sent = None
 
     while True:
-        users = load_users()
+        users = load_json(USERS_FILE)
+        weekly = load_json(WEEKLY_FILE)
 
-        for key, user in users.items():
-            nickname = user["nickname"]
-            player = get_player(nickname)
-            matches = get_last_matches(player["player_id"], 1)
-
-            if not matches:
+        for user in users.values():
+            nick = user["nickname"]
+            pid = get_player_id(nick)
+            if not pid:
                 continue
 
-            match = matches[0]
-            current_match_id = match["match_id"]
-
-            # FIRST RUN: store but don't post
-            if user["last_match"] is None:
-                user["last_match"] = current_match_id
-                user["last_elo"] = player["games"]["cs2"]["faceit_elo"]
-                save_users(users)
+            match = get_last_match(pid)
+            if not match:
                 continue
 
-            if current_match_id == user["last_match"]:
+            finished = datetime.fromtimestamp(match["finished_at"], timezone.utc)
+
+            if finished < BOT_START_TIME:
+                user["last_match"] = match["match_id"]
+                user["last_elo"] = get_player_elo(pid)
+                user["streak"] = 0
+                save_json(USERS_FILE, users)
                 continue
 
-            # ELO CALC
-            current_elo = player["games"]["cs2"]["faceit_elo"]
-            previous_elo = user["last_elo"]
-            elo_change = current_elo - previous_elo
-            won = elo_change > 0
-
-            streak = update_streak(user, won)
-            user["last_match"] = current_match_id
-            user["last_elo"] = current_elo
-            save_users(users)
-
-            stats = get_match_stats(current_match_id)
-            data = extract_player_and_score(stats, nickname)
-            if not data:
+            if user.get("last_match") == match["match_id"]:
                 continue
 
-            my_score, enemy_score, kills, deaths, kd = data
+            current_elo = get_player_elo(pid)
+            prev_elo = user.get("last_elo")
+            if prev_elo is None:
+                user["last_elo"] = current_elo
+                user["last_match"] = match["match_id"]
+                user["streak"] = 0
+                save_json(USERS_FILE, users)
+                continue
 
-            embed = Embed(
-                title="🎮 Faceit Kamp Afsluttet",
-                description=f"**{nickname}** {'✅ Vundet' if won else '❌ Tabt'}",
-                color=0x2ecc71 if won else 0xe74c3c
+            elo_diff = current_elo - prev_elo
+
+            details = get_match_details(match["match_id"])
+            stats_data = get_match_stats(match["match_id"])
+            if not details or not stats_data:
+                continue
+
+            won = did_player_win(details, nick)
+            streak = update_streak(user.get("streak", 0), won)
+            map_name, score = get_map_and_score(details)
+
+            stats = get_player_stats(stats_data, nick)
+            k, d = stats.get("Kills"), stats.get("Deaths")
+            stats_text = (
+                f"🔫 K/D: {k}/{d} ({round(int(k)/max(int(d),1),2)})"
+                if k and d else "Stats unavailable"
             )
 
-            embed.add_field(name="Resultat", value=f"{my_score}–{enemy_score}", inline=False)
-            embed.add_field(name="Total ELO", value=str(current_elo))
-            embed.add_field(name="ELO ændring", value=f"{elo_change:+}")
-            embed.add_field(name="K/D", value=str(kd))
-            embed.add_field(name="Kills / Deaths", value=f"{kills} / {deaths}")
+            embed = discord.Embed(
+                title=f"🏁 Match finished – {nick}",
+                color=discord.Color.green() if won else discord.Color.red()
+            )
+            embed.add_field(name="Result", value="Win ✅" if won else "Loss ❌", inline=True)
+            embed.add_field(name="Score", value=score, inline=True)
+            embed.add_field(name="Map", value=map_name, inline=True)
+            embed.add_field(name="Stats", value=stats_text, inline=False)
             embed.add_field(
-                name="Streak",
-                value=f"🔥 Win streak: {streak}" if streak > 0 else f"❄ Loss streak: {abs(streak)}",
+                name="ELO",
+                value=f"{prev_elo} → {current_elo} ({elo_diff:+})",
                 inline=False
             )
+            embed.add_field(name="Streak", value=streak, inline=False)
 
             await channel.send(embed=embed)
 
-        await asyncio.sleep(120)
+            user["last_match"] = match["match_id"]
+            user["last_elo"] = current_elo
+            user["streak"] = streak
+            update_weekly(weekly, nick, won, elo_diff)
 
-@client.event
-async def on_ready():
-    print(f"Logged in as {client.user}")
-    client.loop.create_task(match_loop())
+            save_json(USERS_FILE, users)
+            save_json(WEEKLY_FILE, weekly)
 
-client.run(TOKEN)
+        if is_weekly_recap_time(last_weekly_sent):
+            await send_weekly_recap(channel, weekly)
+            save_json(WEEKLY_FILE, {})
+            last_weekly_sent = datetime.now(DK_TZ)
+
+        await asyncio.sleep(CHECK_INTERVAL)
+
+# ================== START ==================
+bot.run(DISCORD_TOKEN)
