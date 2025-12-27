@@ -4,10 +4,9 @@ import requests
 import asyncio
 import json
 import os
-import time
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
-from requests.exceptions import RequestException
 
 # ================== ENV ==================
 load_dotenv()
@@ -17,11 +16,12 @@ FACEIT_API_KEY = os.getenv("FACEIT_API_KEY")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 
 USERS_FILE = "users.json"
+WEEKLY_FILE = "weekly_stats.json"
 CHECK_INTERVAL = 120
-STATS_RETRY_DELAY = 120  # sekunder
 
 HEADERS = {"Authorization": f"Bearer {FACEIT_API_KEY}"}
 BOT_START_TIME = datetime.now(timezone.utc)
+DK_TZ = ZoneInfo("Europe/Copenhagen")
 
 # ================== BOT ==================
 intents = discord.Intents.default()
@@ -29,18 +29,15 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 # ================== API ==================
-def faceit_get(url, retries=3, delay=2):
-    for i in range(retries):
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=10)
-            r.raise_for_status()
-            return r.json()
-        except RequestException:
-            if i < retries - 1:
-                time.sleep(delay)
-    return None
+def faceit_get(url):
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
 
-# ================== FILES ==================
+# ================== FILE HELPERS ==================
 def load_json(path):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -62,24 +59,27 @@ def get_player_elo(pid):
     return d["games"]["cs2"]["faceit_elo"] if d else None
 
 def get_last_match(pid):
-    d = faceit_get(f"https://open.faceit.com/data/v4/players/{pid}/history?game=cs2&limit=1")
+    d = faceit_get(
+        f"https://open.faceit.com/data/v4/players/{pid}/history?game=cs2&limit=1"
+    )
     return d["items"][0] if d and d.get("items") else None
+
+def get_last_match_stats(pid):
+    d = faceit_get(
+        f"https://open.faceit.com/data/v4/players/{pid}/history?game=cs2&limit=1"
+    )
+    if not d or not d.get("items"):
+        return {}
+    return d["items"][0].get("stats", {})
 
 def did_player_win(details, nick):
     winner = details["results"]["winner"]
-    for team in details["teams"].values():
+    for faction in ["faction1", "faction2"]:
+        team = details["teams"].get(faction, {})
         for p in team.get("players", []):
             if p["nickname"].lower() == nick.lower():
-                return team["team_id"] == winner
+                return faction == winner
     return False
-
-def get_player_stats(details, nick):
-    for rnd in details.get("rounds", []):
-        for team in rnd.get("teams", []):
-            for p in team.get("players", []):
-                if p["nickname"].lower() == nick.lower():
-                    return p.get("player_stats", {})
-    return {}
 
 def get_map_and_score(details):
     map_name = details.get("voting", {}).get("map", {}).get("pick", ["Unknown"])[0]
@@ -92,44 +92,43 @@ def update_streak(prev, won):
         return 1 if prev <= 0 else prev + 1
     return -1 if prev >= 0 else prev - 1
 
-# ================== LOCKED STATS RETRY ==================
-async def retry_stats_edit_only(message_id, channel_id, match_id, nick):
-    await asyncio.sleep(STATS_RETRY_DELAY)
+# ================== WEEKLY ==================
+def update_weekly(weekly, nick, won, elo_diff):
+    if nick not in weekly:
+        weekly[nick] = {"games": 0, "wins": 0, "losses": 0, "elo": 0}
+    weekly[nick]["games"] += 1
+    weekly[nick]["elo"] += elo_diff
+    if won:
+        weekly[nick]["wins"] += 1
+    else:
+        weekly[nick]["losses"] += 1
 
-    channel = bot.get_channel(channel_id)
-    if not channel:
+def is_weekly_recap_time(last_sent):
+    now = datetime.now(DK_TZ)
+    return (
+        now.weekday() == 6 and
+        now.hour == 22 and
+        (last_sent is None or last_sent.date() != now.date())
+    )
+
+async def send_weekly_recap(channel, weekly):
+    if not weekly:
         return
-
-    try:
-        message = await channel.fetch_message(message_id)
-    except Exception:
-        return  # message findes ikke → gør intet
-
-    details = faceit_get(f"https://open.faceit.com/data/v4/matches/{match_id}")
-    if not details:
-        return
-
-    stats = get_player_stats(details, nick)
-    if not stats.get("Kills"):
-        return  # stadig ikke klar → stop, ingen ekstra handling
-
-    k, d = int(stats["Kills"]), int(stats["Deaths"])
-    kd = round(k / max(d, 1), 2)
-
-    old = message.embeds[0]
-    new = discord.Embed(title=old.title, color=old.color)
-
-    for f in old.fields:
-        if f.name == "Stats":
-            new.add_field(
-                name="Stats",
-                value=f"🔫 K/D: {k}/{d} ({kd})",
-                inline=False
-            )
-        else:
-            new.add_field(name=f.name, value=f.value, inline=f.inline)
-
-    await message.edit(embed=new)
+    embed = discord.Embed(
+        title="📊 Weekly Faceit Recap",
+        color=discord.Color.gold()
+    )
+    for nick, s in weekly.items():
+        embed.add_field(
+            name=nick,
+            value=(
+                f"Kampe: {s['games']}\n"
+                f"W/L: {s['wins']} / {s['losses']}\n"
+                f"ELO: {s['elo']:+}"
+            ),
+            inline=False
+        )
+    await channel.send(embed=embed)
 
 # ================== EVENTS ==================
 @bot.event
@@ -141,9 +140,11 @@ async def on_ready():
 async def match_loop():
     await bot.wait_until_ready()
     channel = bot.get_channel(CHANNEL_ID)
+    last_weekly_sent = None
 
     while True:
         users = load_json(USERS_FILE)
+        weekly = load_json(WEEKLY_FILE)
 
         for user in users.values():
             nick = user["nickname"]
@@ -157,6 +158,7 @@ async def match_loop():
 
             finished = datetime.fromtimestamp(match["finished_at"], timezone.utc)
 
+            # Ignore old matches
             if finished < BOT_START_TIME:
                 user["last_match"] = match["match_id"]
                 user["last_elo"] = get_player_elo(pid)
@@ -168,29 +170,36 @@ async def match_loop():
                 continue
 
             current_elo = get_player_elo(pid)
-            if "last_elo" not in user:
+            prev_elo = user.get("last_elo")
+
+            if prev_elo is None:
                 user["last_elo"] = current_elo
                 user["last_match"] = match["match_id"]
                 user["streak"] = 0
                 save_json(USERS_FILE, users)
                 continue
 
-            elo_before = user["last_elo"]
-            elo_diff = current_elo - elo_before
+            elo_diff = current_elo - prev_elo
 
-            details = faceit_get(f"https://open.faceit.com/data/v4/matches/{match['match_id']}")
+            details = faceit_get(
+                f"https://open.faceit.com/data/v4/matches/{match['match_id']}"
+            )
+            if not details:
+                continue
+
             won = did_player_win(details, nick)
             streak = update_streak(user.get("streak", 0), won)
             map_name, score = get_map_and_score(details)
 
-            stats = get_player_stats(details, nick)
-            if stats.get("Kills"):
-                k, d = int(stats["Kills"]), int(stats["Deaths"])
+            stats = get_last_match_stats(pid)
+            kills = stats.get("Kills")
+            deaths = stats.get("Deaths")
+
+            if kills and deaths:
+                k, d = int(kills), int(deaths)
                 stats_text = f"🔫 K/D: {k}/{d} ({round(k/max(d,1),2)})"
-                retry = False
             else:
-                stats_text = "Stats pending…"
-                retry = True
+                stats_text = "Stats unavailable"
 
             embed = discord.Embed(
                 title=f"🏁 Match finished – {nick}",
@@ -200,25 +209,27 @@ async def match_loop():
             embed.add_field(name="Score", value=score, inline=True)
             embed.add_field(name="Map", value=map_name, inline=True)
             embed.add_field(name="Stats", value=stats_text, inline=False)
-            embed.add_field(name="ELO", value=f"{elo_before} → {current_elo} ({elo_diff:+})", inline=False)
+            embed.add_field(
+                name="ELO",
+                value=f"{prev_elo} → {current_elo} ({elo_diff:+})",
+                inline=False
+            )
             embed.add_field(name="Streak", value=streak, inline=False)
 
-            msg = await channel.send(embed=embed)
-
-            if retry:
-                asyncio.create_task(
-                    retry_stats_edit_only(
-                        msg.id,
-                        CHANNEL_ID,
-                        match["match_id"],
-                        nick
-                    )
-                )
+            await channel.send(embed=embed)
 
             user["last_match"] = match["match_id"]
             user["last_elo"] = current_elo
             user["streak"] = streak
+            update_weekly(weekly, nick, won, elo_diff)
+
             save_json(USERS_FILE, users)
+            save_json(WEEKLY_FILE, weekly)
+
+        if is_weekly_recap_time(last_weekly_sent):
+            await send_weekly_recap(channel, weekly)
+            save_json(WEEKLY_FILE, {})
+            last_weekly_sent = datetime.now(DK_TZ)
 
         await asyncio.sleep(CHECK_INTERVAL)
 
