@@ -64,28 +64,42 @@ def get_last_match(pid):
     )
     return d["items"][0] if d and d.get("items") else None
 
-def get_last_match_stats(pid):
-    d = faceit_get(
-        f"https://open.faceit.com/data/v4/players/{pid}/history?game=cs2&limit=1"
-    )
-    if not d or not d.get("items"):
-        return {}
-    return d["items"][0].get("stats", {})
+def get_match_details(match_id):
+    return faceit_get(f"https://open.faceit.com/data/v4/matches/{match_id}")
+
+def get_match_stats(match_id):
+    return faceit_get(f"https://open.faceit.com/data/v4/matches/{match_id}/stats")
+
+def get_player_faction(details, nick):
+    for faction in ["faction1", "faction2"]:
+        for p in details["teams"][faction]["players"]:
+            if p["nickname"].lower() == nick.lower():
+                return faction
+    return None
 
 def did_player_win(details, nick):
-    winner = details["results"]["winner"]
-    for faction in ["faction1", "faction2"]:
-        team = details["teams"].get(faction, {})
-        for p in team.get("players", []):
-            if p["nickname"].lower() == nick.lower():
-                return faction == winner
-    return False
+    faction = get_player_faction(details, nick)
+    if not faction:
+        return False
+
+    score = details["results"]["score"]
+    my_score = score[faction]
+    other = "faction1" if faction == "faction2" else "faction2"
+    other_score = score[other]
+
+    return my_score > other_score
 
 def get_map_and_score(details):
     map_name = details.get("voting", {}).get("map", {}).get("pick", ["Unknown"])[0]
-    s = details.get("results", {}).get("score", {})
-    score = f"{s.get('faction1','?')}-{s.get('faction2','?')}"
-    return map_name, score
+    s = details["results"]["score"]
+    return map_name, f"{s['faction1']}-{s['faction2']}"
+
+def get_player_stats_from_match(stats_data, nick):
+    for team in stats_data.get("rounds", []):
+        for p in team.get("players", []):
+            if p["nickname"].lower() == nick.lower():
+                return p["player_stats"]
+    return {}
 
 def update_streak(prev, won):
     if won:
@@ -121,11 +135,7 @@ async def send_weekly_recap(channel, weekly):
     for nick, s in weekly.items():
         embed.add_field(
             name=nick,
-            value=(
-                f"Kampe: {s['games']}\n"
-                f"W/L: {s['wins']} / {s['losses']}\n"
-                f"ELO: {s['elo']:+}"
-            ),
+            value=f"Kampe: {s['games']}\nW/L: {s['wins']} / {s['losses']}\nELO: {s['elo']:+}",
             inline=False
         )
     await channel.send(embed=embed)
@@ -158,7 +168,6 @@ async def match_loop():
 
             finished = datetime.fromtimestamp(match["finished_at"], timezone.utc)
 
-            # Ignore old matches
             if finished < BOT_START_TIME:
                 user["last_match"] = match["match_id"]
                 user["last_elo"] = get_player_elo(pid)
@@ -171,7 +180,6 @@ async def match_loop():
 
             current_elo = get_player_elo(pid)
             prev_elo = user.get("last_elo")
-
             if prev_elo is None:
                 user["last_elo"] = current_elo
                 user["last_match"] = match["match_id"]
@@ -181,17 +189,16 @@ async def match_loop():
 
             elo_diff = current_elo - prev_elo
 
-            details = faceit_get(
-                f"https://open.faceit.com/data/v4/matches/{match['match_id']}"
-            )
-            if not details:
+            details = get_match_details(match["match_id"])
+            stats_data = get_match_stats(match["match_id"])
+            if not details or not stats_data:
                 continue
 
             won = did_player_win(details, nick)
             streak = update_streak(user.get("streak", 0), won)
             map_name, score = get_map_and_score(details)
 
-            stats = get_last_match_stats(pid)
+            stats = get_player_stats_from_match(stats_data, nick)
             kills = stats.get("Kills")
             deaths = stats.get("Deaths")
 
@@ -234,4 +241,4 @@ async def match_loop():
         await asyncio.sleep(CHECK_INTERVAL)
 
 # ================== START ==================
-bot.run(DISCORD_TOKEN)
+bot.run(DISCORD_TOKEN
