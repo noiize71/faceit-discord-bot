@@ -73,11 +73,13 @@ def get_player_elo(player_id):
         return None
     return data["games"]["cs2"]["faceit_elo"]
 
-def get_last_matches(player_id, limit=1):
+def get_last_match(player_id):
     data = faceit_get(
-        f"https://open.faceit.com/data/v4/players/{player_id}/history?game=cs2&limit={limit}"
+        f"https://open.faceit.com/data/v4/players/{player_id}/history?game=cs2&limit=1"
     )
-    return data.get("items", []) if data else []
+    if not data or not data.get("items"):
+        return None
+    return data["items"][0]
 
 def get_team_players(team):
     return team.get("players") or team.get("roster") or []
@@ -116,12 +118,6 @@ def get_map_and_score(details):
 
     return map_name, score
 
-def get_elo_change_from_match(details, nickname):
-    for p in details.get("results", {}).get("players", []):
-        if p.get("nickname", "").lower() == nickname.lower():
-            return int(p.get("elo", 0))
-    return 0
-
 def update_streak(previous, won):
     if won:
         return 1 if previous <= 0 else previous + 1
@@ -133,7 +129,6 @@ def update_streak(previous, won):
 def update_weekly(weekly, nickname, won, elo_diff):
     if nickname not in weekly:
         weekly[nickname] = {"games": 0, "wins": 0, "losses": 0, "elo": 0}
-
     weekly[nickname]["games"] += 1
     weekly[nickname]["elo"] += elo_diff
     weekly[nickname]["wins" if won else "losses"] += 1
@@ -145,19 +140,13 @@ def is_recap_time():
 async def send_weekly_recap(channel, weekly):
     if not weekly:
         return
-
-    embed = discord.Embed(
-        title="📊 Weekly Faceit Recap",
-        color=discord.Color.gold()
-    )
-
+    embed = discord.Embed(title="📊 Weekly Faceit Recap", color=discord.Color.gold())
     for nick, s in weekly.items():
         embed.add_field(
             name=nick,
             value=f"Kampe: {s['games']}\nW/L: {s['wins']} / {s['losses']}\nELO: {s['elo']:+}",
             inline=False
         )
-
     await channel.send(embed=embed)
 
 # ================== EVENTS ==================
@@ -184,30 +173,45 @@ async def match_loop():
                 if not pid:
                     continue
 
-                matches = get_last_matches(pid, 1)
-                if not matches:
+                match = get_last_match(pid)
+                if not match:
                     continue
 
-                match = matches[0]
                 finished_at = datetime.fromtimestamp(match["finished_at"], timezone.utc)
 
                 # IGNORE matches before bot start
                 if finished_at < BOT_START_TIME:
                     user["last_match"] = match["match_id"]
+                    user["last_elo"] = get_player_elo(pid)
                     save_json(USERS_FILE, users)
                     continue
 
                 if user.get("last_match") == match["match_id"]:
                     continue
 
-                details = faceit_get(f"https://open.faceit.com/data/v4/matches/{match['match_id']}")
+                current_elo = get_player_elo(pid)
+                if current_elo is None:
+                    continue
+
+                # INIT last_elo safely (no post)
+                if "last_elo" not in user:
+                    user["last_elo"] = current_elo
+                    user["last_match"] = match["match_id"]
+                    save_json(USERS_FILE, users)
+                    continue
+
+                elo_before = user["last_elo"]
+                elo_change = current_elo - elo_before
+
+                details = faceit_get(
+                    f"https://open.faceit.com/data/v4/matches/{match['match_id']}"
+                )
                 if not details:
                     continue
 
                 won = did_player_win(details, nickname)
                 map_name, score = get_map_and_score(details)
 
-                # ---- STATS (robust) ----
                 stats = get_player_stats(details, nickname)
                 kills = stats.get("Kills")
                 deaths = stats.get("Deaths")
@@ -220,13 +224,6 @@ async def match_loop():
                     kd = round(kills / max(deaths, 1), 2)
                     stats_text = f"🔫 K/D: {kills}/{deaths} ({kd})"
 
-                # ---- ELO (CORRECT SOURCE) ----
-                elo_change = get_elo_change_from_match(details, nickname)
-                current_elo = get_player_elo(pid)
-                if current_elo is None:
-                    continue
-
-                elo_before = current_elo - elo_change
                 streak = update_streak(user.get("streak", 0), won)
 
                 embed = discord.Embed(
@@ -251,6 +248,7 @@ async def match_loop():
                 await channel.send(embed=embed)
 
                 user["last_match"] = match["match_id"]
+                user["last_elo"] = current_elo
                 user["streak"] = streak
                 update_weekly(weekly, nickname, won, elo_change)
 
