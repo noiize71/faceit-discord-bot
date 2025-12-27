@@ -241,4 +241,4 @@ async def match_loop():
         await asyncio.sleep(CHECK_INTERVAL)
 
 # ================== START ==================
-bot.run(DISCORD_TOKEN
+bot.run(DISCORD_TOKEN)
