@@ -19,6 +19,7 @@ CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 USERS_FILE = "users.json"
 WEEKLY_FILE = "weekly_stats.json"
 CHECK_INTERVAL = 120
+STATS_RETRY_DELAY = 120  # 2 minutter
 
 HEADERS = {
     "Authorization": f"Bearer {FACEIT_API_KEY}"
@@ -107,15 +108,12 @@ def get_player_stats(details, nickname):
 def get_map_and_score(details):
     map_name = "Unknown"
     score = "N/A"
-
     voting = details.get("voting", {}).get("map", {})
     if voting.get("pick"):
         map_name = voting["pick"][0]
-
     score_data = details.get("results", {}).get("score", {})
     if "faction1" in score_data and "faction2" in score_data:
         score = f"{score_data['faction1']}-{score_data['faction2']}"
-
     return map_name, score
 
 def update_streak(previous, won):
@@ -149,6 +147,35 @@ async def send_weekly_recap(channel, weekly):
         )
     await channel.send(embed=embed)
 
+# ================== STATS RETRY ==================
+
+async def retry_stats(message, match_id, nickname):
+    await asyncio.sleep(STATS_RETRY_DELAY)
+
+    details = faceit_get(f"https://open.faceit.com/data/v4/matches/{match_id}")
+    if not details:
+        return
+
+    stats = get_player_stats(details, nickname)
+    kills = stats.get("Kills")
+    deaths = stats.get("Deaths")
+
+    if kills is None or deaths is None:
+        return  # stadig ikke klar
+
+    kills = int(kills)
+    deaths = int(deaths)
+    kd = round(kills / max(deaths, 1), 2)
+
+    embed = message.embeds[0]
+    embed.set_field_at(
+        index=3,
+        name="Stats",
+        value=f"🔫 K/D: {kills}/{deaths} ({kd})",
+        inline=False
+    )
+    await message.edit(embed=embed)
+
 # ================== EVENTS ==================
 
 @bot.event
@@ -179,7 +206,6 @@ async def match_loop():
 
                 finished_at = datetime.fromtimestamp(match["finished_at"], timezone.utc)
 
-                # IGNORE matches before bot start
                 if finished_at < BOT_START_TIME:
                     user["last_match"] = match["match_id"]
                     user["last_elo"] = get_player_elo(pid)
@@ -193,7 +219,6 @@ async def match_loop():
                 if current_elo is None:
                     continue
 
-                # INIT last_elo safely (no post)
                 if "last_elo" not in user:
                     user["last_elo"] = current_elo
                     user["last_match"] = match["match_id"]
@@ -217,12 +242,14 @@ async def match_loop():
                 deaths = stats.get("Deaths")
 
                 if kills is None or deaths is None:
-                    stats_text = "Stats unavailable"
+                    stats_text = "Stats pending…"
+                    needs_retry = True
                 else:
                     kills = int(kills)
                     deaths = int(deaths)
                     kd = round(kills / max(deaths, 1), 2)
                     stats_text = f"🔫 K/D: {kills}/{deaths} ({kd})"
+                    needs_retry = False
 
                 streak = update_streak(user.get("streak", 0), won)
 
@@ -245,7 +272,12 @@ async def match_loop():
                     inline=False
                 )
 
-                await channel.send(embed=embed)
+                msg = await channel.send(embed=embed)
+
+                if needs_retry:
+                    asyncio.create_task(
+                        retry_stats(msg, match["match_id"], nickname)
+                    )
 
                 user["last_match"] = match["match_id"]
                 user["last_elo"] = current_elo
