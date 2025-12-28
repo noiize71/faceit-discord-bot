@@ -59,14 +59,21 @@ def get_player_elo(pid):
     return d["games"]["cs2"]["faceit_elo"] if d else None
 
 def get_last_match(pid):
-    d = faceit_get(f"https://open.faceit.com/data/v4/players/{pid}/history?game=cs2&limit=1")
+    d = faceit_get(
+        f"https://open.faceit.com/data/v4/players/{pid}/history?game=cs2&limit=1"
+    )
     return d["items"][0] if d and d.get("items") else None
+
+def get_last_match_stats_from_history(pid):
+    d = faceit_get(
+        f"https://open.faceit.com/data/v4/players/{pid}/history?game=cs2&limit=1"
+    )
+    if not d or not d.get("items"):
+        return {}
+    return d["items"][0].get("stats", {})
 
 def get_match_details(match_id):
     return faceit_get(f"https://open.faceit.com/data/v4/matches/{match_id}")
-
-def get_match_stats(match_id):
-    return faceit_get(f"https://open.faceit.com/data/v4/matches/{match_id}/stats")
 
 def get_team_players(team):
     return team.get("players") or team.get("roster") or []
@@ -94,13 +101,6 @@ def get_map_and_score(details):
     s = details["results"]["score"]
     return map_name, f"{s['faction1']}-{s['faction2']}"
 
-def get_player_stats(stats_data, nick):
-    for team in stats_data.get("rounds", []):
-        for p in team.get("players", []):
-            if p.get("nickname", "").lower() == nick.lower():
-                return p.get("player_stats", {})
-    return {}
-
 def update_streak(prev, won):
     if won:
         return 1 if prev <= 0 else prev + 1
@@ -125,11 +125,18 @@ def is_weekly_recap_time(last_sent):
 async def send_weekly_recap(channel, weekly):
     if not weekly:
         return
-    embed = discord.Embed(title="📊 Weekly Faceit Recap", color=discord.Color.gold())
+    embed = discord.Embed(
+        title="📊 Weekly Faceit Recap",
+        color=discord.Color.gold()
+    )
     for nick, s in weekly.items():
         embed.add_field(
             name=nick,
-            value=f"Kampe: {s['games']}\nW/L: {s['wins']} / {s['losses']}\nELO: {s['elo']:+}",
+            value=(
+                f"Kampe: {s['games']}\n"
+                f"W/L: {s['wins']} / {s['losses']}\n"
+                f"ELO: {s['elo']:+}"
+            ),
             inline=False
         )
     await channel.send(embed=embed)
@@ -184,20 +191,23 @@ async def match_loop():
             elo_diff = current_elo - prev_elo
 
             details = get_match_details(match["match_id"])
-            stats_data = get_match_stats(match["match_id"])
-            if not details or not stats_data:
+            if not details:
                 continue
 
             won = did_player_win(details, nick)
             streak = update_streak(user.get("streak", 0), won)
             map_name, score = get_map_and_score(details)
 
-            stats = get_player_stats(stats_data, nick)
-            k, d = stats.get("Kills"), stats.get("Deaths")
-            stats_text = (
-                f"🔫 K/D: {k}/{d} ({round(int(k)/max(int(d),1),2)})"
-                if k and d else "Stats unavailable"
-            )
+            # ✅ STATS FRA PLAYER HISTORY (SAMME SOM GAMMEL KODE)
+            stats = get_last_match_stats_from_history(pid)
+            kills = stats.get("Kills")
+            deaths = stats.get("Deaths")
+
+            if kills and deaths:
+                k, d = int(kills), int(deaths)
+                stats_text = f"🔫 K/D: {k}/{d} ({round(k/max(d,1),2)})"
+            else:
+                stats_text = "Stats unavailable"
 
             embed = discord.Embed(
                 title=f"🏁 Match finished – {nick}",
